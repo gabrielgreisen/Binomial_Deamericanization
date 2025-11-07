@@ -49,6 +49,44 @@ def get_option_chain(ticker: str, expiry: str):
     except Exception as e:
         print(f"Error fetching option chain for {ticker} on {expiry}: {e}")
         return pd.DataFrame(), pd.DataFrame() # Return two empty frames so pipeline doesn't break
+    
+def get_spot_price(ticker):
+    """
+    Fetches the current spot price for a stock ticker. Falls back to the most recent
+    close if a live price is not available.
+
+    Parameters
+    ----------
+    ticker : str
+        Stock ticker symbol (e.g., 'AAPL').
+
+    Returns
+    -------
+    float or None
+        Spot price (live if available, else last close). Returns None if unavailable.
+    """
+
+    try:
+        tk = yf.Ticker(ticker)
+        
+        # Attempt to fetch live price
+        live_price = tk.fast_info.get("last_price", None)
+        if live_price and live_price > 0:
+            return live_price
+
+        # Fallback: most recent close
+        hist = tk.history(period="1d")
+        if not hist.empty:
+            fallback_price = hist["Close"].iloc[-1]
+            print(f"[{ticker}] Live price unavailable — using last close: {fallback_price:.2f}")
+            return fallback_price
+
+        print(f"[{ticker}] No live or historical data available.")
+        return None
+
+    except Exception as e:
+        print(f"[{ticker}] Spot price fetch failed: {e}")
+        return None
 
 def get_option_chains_all(ticker: str,
                                   max_workers: int = 8) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -116,5 +154,19 @@ def get_option_chains_all(ticker: str,
     # Concatenate results
     all_calls = pd.concat(calls_accum, ignore_index=True) if calls_accum else pd.DataFrame()
     all_puts  = pd.concat(puts_accum,  ignore_index=True) if puts_accum  else pd.DataFrame()
+
+    # Fetch dividend yield and spot price for the company
+    dividendYield = stock.info.get("dividendYield")
+    if dividendYield is not None:
+        dividendYield = dividendYield/100 # percentages on decimal basis
+    all_calls["dividendYield"] = dividendYield
+    all_puts["dividendYield"] = dividendYield
+
+    all_calls["ticker"] = ticker
+    all_puts["ticker"] = ticker
+
+    spot_price = get_spot_price(ticker)
+    all_calls["spot_price"] = spot_price
+    all_puts["spot_price"] = spot_price
 
     return all_calls, all_puts

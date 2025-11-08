@@ -1,8 +1,37 @@
 import yfinance as yf
 import pandas as pd
+import time, random, math, requests
 from datetime import datetime
 from typing import List, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+try:
+    from yfinance.exceptions import YFRateLimitError  # newer versions
+except Exception:  # fallback when not exported
+    class YFRateLimitError(Exception):
+        pass
+
+def _is_rate_limit_error(e: Exception) -> bool:
+    msg = str(e).lower()
+    return ("rate limit" in msg) or ("too many requests" in msg) or ("429" in msg) or ("yf ratelimit" in msg)
+
+def _sleep_backoff(attempt: int, base: float = 1.6, jitter: float = 0.35, cap: float = 30.0):
+    delay = min(cap, (base ** attempt) * (1.0 + random.random() * jitter))
+    time.sleep(delay)
+
+def _retry(fn, tries: int = 5):
+    """Retry a callable on yfinance/network rate limits with exponential backoff."""
+    attempt = 0
+    while True:
+        try:
+            return fn()
+        except Exception as e:
+            transient = isinstance(e, YFRateLimitError) or _is_rate_limit_error(e)
+            attempt += 1
+            if (not transient) or attempt >= tries:
+                raise
+            _sleep_backoff(attempt)
+
 
 def get_option_chain(ticker: str, expiry: str):
 
@@ -23,31 +52,28 @@ def get_option_chain(ticker: str, expiry: str):
     """
     
     try:
-        stock = yf.Ticker(ticker)
+        stock = yf.Ticker(ticker)  # <-- no session
+        options = _retry(lambda: stock.options)
+        if expiry not in options:
+            raise ValueError(f"Expiration `{expiry}` not found. Available: {options}")
 
-        if expiry not in stock.options:
-            raise ValueError(f"Expiration `{expiry}` cannot be found. Available expirations are: {stock.options}")
+        chain = _retry(lambda: stock.option_chain(expiry))
+        calls = chain.calls.copy()
+        puts  = chain.puts.copy()
 
-        option_chain = stock.option_chain(expiry)
-        calls = option_chain.calls.copy()
-        puts = option_chain.puts.copy()
+        # Labels
+        calls["option_type"] = "call"
+        puts["option_type"]  = "put"
 
-        # Add option type labels for downstream processing
-        calls['option_type'] = 'call'
-        puts['option_type'] = 'put'
-
-        # Add Time To Maturity (TTM) in years
-        expiry_date = datetime.strptime(expiry, "%Y-%m-%d").date()
+        # Time to maturity (years)
         today = datetime.today().date()
-        ttm = max((expiry_date - today).days/365.0, 0)
-
-        calls['TTM'] = ttm
-        puts['TTM'] = ttm
-
-
+        exp_date = datetime.strptime(expiry, "%Y-%m-%d").date()
+        ttm = max((exp_date - today).days / 365.0, 0.0)
+        calls["TTM"] = ttm
+        puts["TTM"]  = ttm
         return calls, puts
     except Exception as e:
-        print(f"Error fetching option chain for {ticker} on {expiry}: {e}")
+        print(f"[get_option_chain] {ticker} {expiry}: {e}")
         return pd.DataFrame(), pd.DataFrame() # Return two empty frames so pipeline doesn't break
     
 def get_spot_price(ticker):
@@ -67,25 +93,36 @@ def get_spot_price(ticker):
     """
 
     try:
-        tk = yf.Ticker(ticker)
-        
-        # Attempt to fetch live price
-        live_price = tk.fast_info.get("last_price", None)
-        if live_price and live_price > 0:
-            return live_price
+        tk = yf.Ticker(ticker)  # <-- no session
 
-        # Fallback: most recent close
-        hist = tk.history(period="1d")
-        if not hist.empty:
-            fallback_price = hist["Close"].iloc[-1]
-            print(f"[{ticker}] Live price unavailable — using last close: {fallback_price:.2f}")
-            return fallback_price
+        def _live():
+            fi = tk.fast_info
+            # keys vary across versions
+            for key in ("last_price", "regular_market_price", "lastPrice", "regularMarketPrice"):
+                v = fi.get(key)
+                if v and v > 0:
+                    return float(v)
+            return None
+
+        live = _retry(_live)
+        if live is not None:
+            return live
+
+        def _hist():
+            h = tk.history(period="5d", auto_adjust=False)
+            if not h.empty:
+                return float(h["Close"].iloc[-1])
+            return None
+
+        fallback = _retry(_hist)
+        if fallback is not None:
+            print(f"[{ticker}] Live price unavailable — using last close: {fallback:.4f}")
+            return fallback
 
         print(f"[{ticker}] No live or historical data available.")
         return None
-
     except Exception as e:
-        print(f"[{ticker}] Spot price fetch failed: {e}")
+        print(f"[get_spot_price] {ticker}: {e}")
         return None
 
 def get_option_chains_all(ticker: str,
@@ -110,63 +147,89 @@ def get_option_chains_all(ticker: str,
             * 'TTM'         = time to maturity in years
         - puts_df: DataFrame containing all puts with the same added columns.
     """
-    stock = yf.Ticker(ticker)
-    expiries = stock.options  # list of expiry date strings
-    today = datetime.today().date()
+    stock = yf.Ticker(ticker)  # <-- no session
+    try:
+        expiries = _retry(lambda: stock.options) or []
+    except Exception as e:
+        print(f"[{ticker}] Failed to list expiries: {e}")
+        return pd.DataFrame(), pd.DataFrame()
 
-    calls_accum = []
-    puts_accum  = []
+    today = datetime.today().date()
+    calls_accum, puts_accum = [], []
 
     def fetch_chain(expiry: str):
-        """Fetch calls/puts for a single expiry and return (expiry, calls_df, puts_df)."""
         try:
-            chain = stock.option_chain(expiry)
-            calls = chain.calls.copy()
-            puts  = chain.puts.copy()
+            chain = _retry(lambda: stock.option_chain(expiry))
+            c = chain.calls.copy()
+            p = chain.puts.copy()
         except Exception as e:
-            # Return None on error so we can skip later
-            return expiry, None, None
+            print(f"[{ticker}] skip {expiry}: {e}")
+            return None, None
 
-        # Tag each row with type and expiration
-        calls['option_type']  = 'call'
-        puts ['option_type']  = 'put'
-        calls['expiration']   = expiry
-        puts ['expiration']   = expiry
+        if c is not None and not c.empty:
+            c["option_type"] = "call"
+            c["expiration"]  = expiry
+            exp_date = datetime.strptime(expiry, "%Y-%m-%d").date()
+            c["TTM"] = max((exp_date - today).days / 365.0, 0.0)
+        if p is not None and not p.empty:
+            p["option_type"] = "put"
+            p["expiration"]  = expiry
+            exp_date = datetime.strptime(expiry, "%Y-%m-%d").date()
+            p["TTM"] = max((exp_date - today).days / 365.0, 0.0)
 
-        # Compute time-to-maturity once
-        exp_date = datetime.strptime(expiry, "%Y-%m-%d").date()
-        ttm = max((exp_date - today).days / 365.0, 0.0)
-        calls['TTM'] = ttm
-        puts ['TTM'] = ttm
+        time.sleep(0.2)  # gentle pacing helps avoid bursts
+        return c, p
 
-        return expiry, calls, puts
+    # Keep concurrency low; high fan-out triggers 429s
+    with ThreadPoolExecutor(max_workers=max(1, int(max_workers))) as ex:
+        futures = [ex.submit(fetch_chain, e) for e in expiries]
+        for fut in as_completed(futures):
+            c, p = fut.result()
+            if isinstance(c, pd.DataFrame) and not c.empty:
+                calls_accum.append(c)
+            if isinstance(p, pd.DataFrame) and not p.empty:
+                puts_accum.append(p)
 
-    # Fetch in parallel
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(fetch_chain, exp) for exp in expiries]
-        for future in as_completed(futures):
-            expiry, calls_df, puts_df = future.result()
-            if calls_df is not None and not calls_df.empty:
-                calls_accum.append(calls_df)
-            if puts_df  is not None and not puts_df.empty:
-                puts_accum.append(puts_df)
-
-    # Concatenate results
     all_calls = pd.concat(calls_accum, ignore_index=True) if calls_accum else pd.DataFrame()
     all_puts  = pd.concat(puts_accum,  ignore_index=True) if puts_accum  else pd.DataFrame()
 
-    # Fetch dividend yield and spot price for the company
-    dividendYield = stock.info.get("dividendYield")
-    if dividendYield is not None:
-        dividendYield = dividendYield/100 # percentages on decimal basis
-    all_calls["dividendYield"] = dividendYield
-    all_puts["dividendYield"] = dividendYield
+    # Spot price (once per ticker)
+    spot = get_spot_price(ticker)
 
-    all_calls["ticker"] = ticker
-    all_puts["ticker"] = ticker
+    # Dividend yield: decimal preferred; fallback to rate/spot
+    def _normalize_dividend_yield() -> float:
+        try:
+            info = _retry(lambda: stock.info)
+        except Exception:
+            info = {}
 
-    spot_price = get_spot_price(ticker)
-    all_calls["spot_price"] = spot_price
-    all_puts["spot_price"] = spot_price
+        dy_raw = info.get("dividendYield", None)  # usually decimal like 0.0123
+        if dy_raw is not None:
+            try:
+                y = float(dy_raw)
+                if math.isfinite(y):
+                    return y / 100.0 if y > 1.5 else y  # guard against percent-like inputs
+            except Exception:
+                pass
+
+        try:
+            div_rate = info.get("trailingAnnualDividendRate", None)
+            if div_rate is not None and spot:
+                y = float(div_rate) / float(spot)
+                if math.isfinite(y) and y >= 0:
+                    return y
+        except Exception:
+            pass
+
+        return 0.0
+
+    dividend_yield = _normalize_dividend_yield()
+
+    # Attach metadata
+    for df in (all_calls, all_puts):
+        if not df.empty:
+            df["ticker"] = ticker
+            df["dividendYield"] = dividend_yield
+            df["spot_price"] = spot
 
     return all_calls, all_puts

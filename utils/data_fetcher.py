@@ -1,157 +1,177 @@
 import yfinance as yf
 import pandas as pd
-import time, random, math, requests
+import time, random, math
 from datetime import datetime
-from typing import List, Tuple
+from typing import Tuple, Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# --- yfinance rate-limit compatibility shim (works across versions) ---
 try:
     from yfinance.exceptions import YFRateLimitError  # newer versions
 except Exception:  # fallback when not exported
     class YFRateLimitError(Exception):
         pass
 
+# -------------------------
+# Error classification
+# -------------------------
 def _is_rate_limit_error(e: Exception) -> bool:
+    """
+    Return True for yfinance/curl-cffi 429 'Too Many Requests' and similar
+    transient throttling/network messages.
+    """
     msg = str(e).lower()
-    return ("rate limit" in msg) or ("too many requests" in msg) or ("429" in msg) or ("yf ratelimit" in msg)
+    resp = getattr(e, "response", None)
+    code = getattr(resp, "status_code", None)
+    return (
+        code == 429
+        or "too many requests" in msg
+        or "rate limit" in msg
+        or "429" in msg
+        or "yf ratelimit" in msg
+        or "temporarily unavailable" in msg
+        or "timed out" in msg
+        or "timeout" in msg
+        or "ssl" in msg
+    )
 
-def _sleep_backoff(attempt: int, base: float = 1.6, jitter: float = 0.35, cap: float = 30.0):
+def _is_permanent_ticker_error(e: Exception) -> bool:
+    """Errors we shouldn't retry: delisted, invalid symbol, etc."""
+    msg = str(e).lower()
+    return any(s in msg for s in [
+        "delisted", "de-listed",
+        "no data found", "no timezone found",
+        "not found in table", "invalid", "unknown symbol",
+        "no option chain", "does not have any options",
+        "symbol not found"
+    ])
+
+# -------------------------
+# Backoff / retry
+# -------------------------
+def _sleep_backoff(attempt: int, base: float = 1.35, jitter: float = 0.25, cap: float = 12.0):
     delay = min(cap, (base ** attempt) * (1.0 + random.random() * jitter))
     time.sleep(delay)
 
-def _retry(fn, tries: int = 5):
-    """Retry a callable on yfinance/network rate limits with exponential backoff."""
+def _retry(fn: Callable[[], object],
+           tries: int = 4,
+           base: float = 1.35,
+           jitter: float = 0.25,
+           cap: float = 12.0):
+    """Retry only for transient / rate-limit looking errors."""
     attempt = 0
     while True:
         try:
             return fn()
         except Exception as e:
-            transient = isinstance(e, YFRateLimitError) or _is_rate_limit_error(e)
             attempt += 1
-            if (not transient) or attempt >= tries:
+            if not _is_rate_limit_error(e) or attempt >= tries:
                 raise
-            _sleep_backoff(attempt)
+            _sleep_backoff(attempt, base, jitter, cap)
 
-
-def get_option_chain(ticker: str, expiry: str):
-
+# -------------------------
+# Single-expiry fetch
+# -------------------------
+def get_option_chain(ticker: str, expiry: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Fetches the option chain (calls and puts) for a given stock ticker and expiry date.
-
-    Parameters
-    ----------
-    ticker : str
-        Stock ticker symbol (e.g., 'AAPL')
-    expiry : str
-        Expiration date in 'YYYY-MM-DD' format
-
-    Returns
-    -------
-    tuple[pd.DataFrame, pd.DataFrame]
-        Calls DataFrame, Puts DataFrame
+    Fetch the option chain for a ticker/expiry. Returns (calls_df, puts_df).
+    Adds: 'option_type' and 'TTM'. Raises on transient 'options is None'.
     """
-    
-    try:
-        stock = yf.Ticker(ticker)  # <-- no session
-        options = _retry(lambda: stock.options)
-        if expiry not in options:
-            raise ValueError(f"Expiration `{expiry}` not found. Available: {options}")
+    stock = yf.Ticker(ticker)
 
-        chain = _retry(lambda: stock.option_chain(expiry))
-        calls = chain.calls.copy()
-        puts  = chain.puts.copy()
+    options = _retry(lambda: stock.options)
+    if options is None:
+        # transient hiccup from Yahoo → let caller retry
+        raise RuntimeError("transient: options returned None")
+    options = list(options)
+    if expiry not in options:
+        raise ValueError(f"Expiration `{expiry}` not found. Available: {options}")
 
-        # Labels
-        calls["option_type"] = "call"
-        puts["option_type"]  = "put"
+    chain = _retry(lambda: stock.option_chain(expiry))
+    calls = chain.calls.copy()
+    puts  = chain.puts.copy()
 
-        # Time to maturity (years)
-        today = datetime.today().date()
-        exp_date = datetime.strptime(expiry, "%Y-%m-%d").date()
-        ttm = max((exp_date - today).days / 365.0, 0.0)
-        calls["TTM"] = ttm
-        puts["TTM"]  = ttm
-        return calls, puts
-    except Exception as e:
-        print(f"[get_option_chain] {ticker} {expiry}: {e}")
-        return pd.DataFrame(), pd.DataFrame() # Return two empty frames so pipeline doesn't break
-    
-def get_spot_price(ticker):
+    # Labels
+    calls["option_type"] = "call"
+    puts["option_type"]  = "put"
+
+    # Time to maturity (years)
+    today = datetime.today().date()
+    exp_date = datetime.strptime(expiry, "%Y-%m-%d").date()
+    ttm = max((exp_date - today).days / 365.0, 0.0)
+    calls["TTM"] = ttm
+    puts["TTM"]  = ttm
+    return calls, puts
+
+# -------------------------
+# Spot price with fallback
+# -------------------------
+def get_spot_price(ticker: str):
     """
-    Fetches the current spot price for a stock ticker. Falls back to the most recent
-    close if a live price is not available.
-
-    Parameters
-    ----------
-    ticker : str
-        Stock ticker symbol (e.g., 'AAPL').
-
-    Returns
-    -------
-    float or None
-        Spot price (live if available, else last close). Returns None if unavailable.
+    Return spot price (live via fast_info if possible, else recent close). None if unavailable.
     """
+    tk = yf.Ticker(ticker)
+
+    def _live():
+        fi = tk.fast_info
+        for key in ("last_price", "regular_market_price", "lastPrice", "regularMarketPrice"):
+            v = fi.get(key)
+            if v and v > 0:
+                return float(v)
+        return None
 
     try:
-        tk = yf.Ticker(ticker)  # <-- no session
-
-        def _live():
-            fi = tk.fast_info
-            # keys vary across versions
-            for key in ("last_price", "regular_market_price", "lastPrice", "regularMarketPrice"):
-                v = fi.get(key)
-                if v and v > 0:
-                    return float(v)
-            return None
-
         live = _retry(_live)
         if live is not None:
             return live
+    except Exception:
+        pass
 
-        def _hist():
-            h = tk.history(period="5d", auto_adjust=False)
-            if not h.empty:
-                return float(h["Close"].iloc[-1])
-            return None
+    def _hist():
+        h = tk.history(period="5d", auto_adjust=False)
+        if not h.empty:
+            return float(h["Close"].iloc[-1])
+        return None
 
+    try:
         fallback = _retry(_hist)
         if fallback is not None:
-            print(f"[{ticker}] Live price unavailable — using last close: {fallback:.4f}")
             return fallback
+    except Exception:
+        pass
 
-        print(f"[{ticker}] No live or historical data available.")
-        return None
-    except Exception as e:
-        print(f"[get_spot_price] {ticker}: {e}")
-        return None
+    return None
 
-def get_option_chains_all(ticker: str,
-                                  max_workers: int = 8) -> Tuple[pd.DataFrame, pd.DataFrame]:
+# -------------------------
+# All-expiries fetch
+# -------------------------
+def get_option_chains_all(
+    ticker: str,
+    max_workers: int = 2,
+    per_expiry_sleep: float = 0.08,
+    retry_tries: int = 4,
+    retry_base: float = 1.35,
+    retry_cap: float = 12.0,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Fetches option chains (calls and puts) for every available expiry of a given ticker,
-    performing API requests in parallel to reduce total fetch time.
-
-    Parameters
-    ----------
-    ticker : str
-        Stock ticker symbol (e.g., 'AAPL').
-    max_workers : int, optional
-        Maximum number of threads to use for concurrent fetching (default is 8).
-
-    Returns
-    -------
-    Tuple[pd.DataFrame, pd.DataFrame]
-        - calls_df: DataFrame containing all calls across expiries, with added columns:
-            * 'option_type' = 'call'
-            * 'expiration'  = expiry date string 'YYYY-MM-DD'
-            * 'TTM'         = time to maturity in years
-        - puts_df: DataFrame containing all puts with the same added columns.
+    Fetch calls & puts for **all available expiries** of `ticker`.
+    Returns (all_calls_df, all_puts_df) with:
+      - option_type, expiration, TTM, ticker, dividendYield (decimal), spot_price
     """
-    stock = yf.Ticker(ticker)  # <-- no session
-    try:
-        expiries = _retry(lambda: stock.options) or []
-    except Exception as e:
-        print(f"[{ticker}] Failed to list expiries: {e}")
+    stock = yf.Ticker(ticker)
+
+    def _r(f):  # helper to carry retry params
+        return _retry(f, tries=retry_tries, base=retry_base, cap=retry_cap)
+
+    # List ALL expiries
+    expiries = _r(lambda: stock.options)
+    if expiries is None:
+        # transient hiccup → let caller/multi_fetcher retry this ticker
+        raise RuntimeError("transient: options returned None")
+    expiries = list(expiries)
+
+    # Ticker may legitimately have no options (not an error)
+    if len(expiries) == 0:
         return pd.DataFrame(), pd.DataFrame()
 
     today = datetime.today().date()
@@ -159,11 +179,19 @@ def get_option_chains_all(ticker: str,
 
     def fetch_chain(expiry: str):
         try:
-            chain = _retry(lambda: stock.option_chain(expiry))
+            chain = _r(lambda: stock.option_chain(expiry))
             c = chain.calls.copy()
             p = chain.puts.copy()
         except Exception as e:
-            print(f"[{ticker}] skip {expiry}: {e}")
+            # Structured error output for easier tracking
+            etype = type(e).__name__
+            msg = str(e)
+            if _is_permanent_ticker_error(e):
+                print(f"[{datetime.now().isoformat()}][{ticker}][{expiry}] PERMANENT {etype}: {msg}")
+            elif _is_rate_limit_error(e):
+                print(f"[{datetime.now().isoformat()}][{ticker}][{expiry}] RATE_LIMIT {etype}: {msg}")
+            else:
+                print(f"[{datetime.now().isoformat()}][{ticker}][{expiry}] TRANSIENT {etype}: {msg}")
             return None, None
 
         if c is not None and not c.empty:
@@ -177,10 +205,11 @@ def get_option_chains_all(ticker: str,
             exp_date = datetime.strptime(expiry, "%Y-%m-%d").date()
             p["TTM"] = max((exp_date - today).days / 365.0, 0.0)
 
-        time.sleep(0.2)  # gentle pacing helps avoid bursts
+        if per_expiry_sleep > 0:
+            time.sleep(per_expiry_sleep)
         return c, p
 
-    # Keep concurrency low; high fan-out triggers 429s
+    # Conservative per-ticker concurrency
     with ThreadPoolExecutor(max_workers=max(1, int(max_workers))) as ex:
         futures = [ex.submit(fetch_chain, e) for e in expiries]
         for fut in as_completed(futures):
@@ -199,7 +228,7 @@ def get_option_chains_all(ticker: str,
     # Dividend yield: decimal preferred; fallback to rate/spot
     def _normalize_dividend_yield() -> float:
         try:
-            info = _retry(lambda: stock.info)
+            info = _r(lambda: stock.info)
         except Exception:
             info = {}
 
@@ -208,7 +237,7 @@ def get_option_chains_all(ticker: str,
             try:
                 y = float(dy_raw)
                 if math.isfinite(y):
-                    return y / 100.0 if y > 1.5 else y  # guard against percent-like inputs
+                    return y / 100.0 if y > 1.5 else y  # guard percent-like inputs
             except Exception:
                 pass
 
